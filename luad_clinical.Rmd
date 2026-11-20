@@ -1,0 +1,262 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+library(BiocManager)
+library(TCGAbiolinks)
+library(maftools)
+library(limma)
+library(ggplot2)
+```
+
+```{r}
+knitr::opts_knit$set(root.dir = normalizePath ("~/490_cluster/analysis_data"))
+```
+
+
+```{r}
+# Download lung adenocarcinoma clinical data
+luad_clinical <- GDCquery_clinic(
+  project = "TCGA-LUAD",
+  type = "clinical"
+)
+
+# Check the dimensions
+dim(luad_clinical)
+
+# View the first few rows
+head(luad_clinical)
+```
+
+```{r}
+colnames(luad_clinical)
+```
+
+```{r}
+
+# check N stages
+n_mask <- ifelse(luad_clinical$ajcc_pathologic_n > 300, "N0", ifelse(luad_clinical$ajcc_pathologic_n > 300))
+
+```
+
+```{r}
+# check N stages
+table(luad_clinical$ajcc_pathologic_n, useNA = "ifany")
+```
+
+```{r}
+ls()
+```
+```{r}
+list.files()
+```
+```{r}
+library(TCGAbiolinks)
+
+query_luad <- GDCquery(
+  project = "TCGA-LUAD",
+  data.category = "DNA Methylation",
+  data.type = "Methylation Beta Value",
+  platform = "Illumina Human Methylation 450",
+  sample.type = "Primary Tumor"
+)
+
+# Number of files found
+nrow(getResults(query_luad))
+```
+
+```{r}
+#download methylation-beta data
+GDCdownload(
+  query_luad,
+  method = "api",
+  files.per.chunk = 10
+)
+```
+
+```{r}
+methylation_luad <- GDCprepare(query_luad)
+```
+```{r}
+class(methylation_luad)
+dim(methylation_luad)
+```
+```{r}
+# Methylation sample IDs
+head(colnames(betas))
+
+# Clinical patient IDs and available columns
+head(rownames(luad_clinical))
+names(luad_clinical)
+```
+
+```{r}
+head(luad_clinical$bcr_patient_barcode)
+
+sum(duplicated(luad_clinical$bcr_patient_barcode))
+
+# Patient IDs extracted from methylation sample names
+head(substr(colnames(betas), 1, 12))
+```
+```{r}
+patient_ids <- substr(colnames(betas), 1, 12)
+
+match_index <- match(
+  patient_ids,
+  luad_clinical$bcr_patient_barcode
+)
+
+# Check matched and unmatched samples
+table(matched = !is.na(match_index))
+
+# Align clinical rows with the methylation columns
+clinical_matched <- luad_clinical[match_index, , drop = FALSE]
+
+# Check N stages in the matched data
+table(clinical_matched$ajcc_pathologic_n, useNA = "ifany")
+
+# Check for repeated patients among methylation samples
+sum(duplicated(patient_ids))
+
+#the result is the 473 methylation samples, with N stages matched from the clinical data
+```
+```{r}
+repeated <- duplicated(patient_ids) |
+  duplicated(patient_ids, fromLast = TRUE)
+
+data.frame(
+  sample = colnames(betas)[repeated],
+  patient = patient_ids[repeated],
+  N_stage = clinical_matched$ajcc_pathologic_n[repeated]
+)
+# some patients have multiple methylation samples
+```
+```{r}
+# Sort sample IDs, then keep one sample per patient
+sample_order <- order(colnames(betas))
+
+keep_index <- sample_order[
+  !duplicated(patient_ids[sample_order])
+]
+
+# Subset both objects in the same order
+betas_unique <- betas[, keep_index, drop = FALSE]
+clinical_unique <- clinical_matched[keep_index, , drop = FALSE]
+
+# Check sample count and N stages
+ncol(betas_unique)
+table(clinical_unique$ajcc_pathologic_n, useNA = "ifany")
+```
+```{r}
+stage <- as.character(clinical_unique$ajcc_pathologic_n)
+
+keep <- stage %in% c("N0", "N1", "N2", "N3")
+
+clinical_n <- clinical_unique[keep, , drop = FALSE]
+betas_n <- betas_unique[, keep, drop = FALSE]
+
+# Combine N1, N2, and N3 into N+
+clinical_n$group <- factor(
+  ifelse(stage[keep] == "N0", "N0", "Nplus"),
+  levels = c("N0", "Nplus")
+)
+
+table(clinical_n$group)
+dim(betas_n)
+```
+```{r}
+# Keep sites with valid beta values in every sample
+valid_cpg <- rowSums(
+  !is.finite(betas_n) | betas_n < 0 | betas_n > 1
+) == 0
+
+betas_clean <- betas_n[valid_cpg, , drop = FALSE]
+
+# Check how many CpGs were kept or removed
+table(valid_cpg)
+dim(betas_clean)
+```
+```{r}
+library(limma)
+
+# Avoid infinite M-values at beta = 0 or 1
+betas_clipped <- pmin(pmax(betas_clean, 1e-6), 1 - 1e-6)
+
+mval <- log2(betas_clipped / (1 - betas_clipped))
+
+# N0 is the reference group
+design <- model.matrix(~ group, data = clinical_n)
+
+fit <- lmFit(mval, design)
+fit2 <- eBayes(fit)
+
+# Check the model coefficients
+colnames(fit2$coefficients)
+
+```
+```{r}
+# Mean beta-value difference: N+ minus N0
+delta_beta <-
+  rowMeans(betas_clean[, clinical_n$group == "Nplus", drop = FALSE]) -
+  rowMeans(betas_clean[, clinical_n$group == "N0", drop = FALSE])
+
+dat <- data.frame(
+  CpG = rownames(betas_clean),
+  delta_beta = delta_beta,
+  pvalue = fit2$p.value[, "groupNplus"]
+)
+
+# Adjust for testing many CpG sites
+dat$FDR <- p.adjust(dat$pvalue, method = "BH")
+
+# Inspect the most statistically significant results
+head(dat[order(dat$FDR), ])
+```
+```{r}
+library(ggplot2)
+
+dat$status <- "FDR >= 0.05"
+dat$status[which(dat$FDR < 0.05 & dat$delta_beta > 0)] <-
+  "Higher in N+"
+dat$status[which(dat$FDR < 0.05 & dat$delta_beta < 0)] <-
+  "Lower in N+"
+
+p <- ggplot(
+  dat,
+  aes(
+    x = delta_beta,
+    y = -log10(pmax(FDR, .Machine$double.xmin)),
+    color = status
+  )
+) +
+  geom_point(alpha = 0.5, size = 0.8) +
+  scale_color_manual(values = c(
+    "FDR >= 0.05" = "grey75",
+    "Higher in N+" = "#D55E00",
+    "Lower in N+" = "#0072B2"
+  )) +
+  geom_hline(
+    yintercept = -log10(0.05),
+    linetype = "dashed"
+  ) +
+  geom_vline(
+    xintercept = c(-0.10, 0.10),
+    linetype = "dashed"
+  ) +
+  labs(
+    title = "LUAD: N+ versus N0",
+    x = "Mean methylation difference (N+ minus N0)",
+    y = "-log10(FDR)",
+    color = NULL
+  ) +
+  theme_bw()
+
+print(p)
+```
+
